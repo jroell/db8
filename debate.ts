@@ -259,7 +259,7 @@ interface Participant {
   agent: AgentBackend;
 }
 
-interface Attachment { path: string; kind: "image" | "pdf" | "text" | "other" }
+interface Attachment { path: string; kind: "image" | "pdf" | "text" | "other"; text?: string; note?: string }
 
 interface DebateSetup {
   topic: string;
@@ -280,6 +280,8 @@ interface RoundVerdict {
   scores: { a: Record<string, number>; b: Record<string, number> };
   roundWinner: "a" | "b" | "tie";
   cruxes: Crux[];
+  nextFocus: { a: string; b: string };
+  clarifications: string[];
   verdictReached: boolean;
   confidence: number;
   leaning: "a" | "b" | "undecided";
@@ -785,6 +787,11 @@ class MockAgent implements AgentBackend {
             { id: "risk-asymmetry", description: "Whether downside risks dominate expected value", status: round >= 2 ? "resolved-a" : "open" },
             { id: "cost-distribution", description: "Who bears concentrated transition costs", status: "open" },
           ],
+          nextFocus: {
+            a: "Quantify the downside-risk asymmetry instead of asserting it.",
+            b: "Name who bears the concentrated costs and for how long.",
+          },
+          clarifications: ["Whether 'measured outcomes' refers to any specific study or is asserted"],
           verdictReached: this.who === "ja" ? round >= 2 : round >= 3,
           confidence: conf, leaning: this.who === "ja" ? "a" : round >= 2 ? "b" : "undecided",
           commentary: `Round ${round}: the *${round % 2 ? "PRO" : "CON"}* side carried the exchange on evidence quality. The open crux remains **cost-distribution**.`,
@@ -818,7 +825,7 @@ const scoreCardSchema = {
 
 const ROUND_SCHEMA = strict({
   type: "object",
-  required: ["onTrack", "steeringNote", "scores", "roundWinner", "cruxes", "verdictReached", "confidence", "leaning", "commentary"],
+  required: ["onTrack", "steeringNote", "scores", "roundWinner", "cruxes", "nextFocus", "clarifications", "verdictReached", "confidence", "leaning", "commentary"],
   properties: {
     onTrack: { type: "boolean" },
     steeringNote: { type: "string" },
@@ -831,6 +838,8 @@ const ROUND_SCHEMA = strict({
         properties: { id: { type: "string" }, description: { type: "string" }, status: { enum: ["open", "resolved-a", "resolved-b", "deadlocked"] } },
       },
     },
+    nextFocus: { type: "object", required: ["a", "b"], properties: { a: { type: "string" }, b: { type: "string" } } },
+    clarifications: { type: "array", items: { type: "string" } },
     verdictReached: { type: "boolean" },
     confidence: { type: "number", minimum: 0, maximum: 1 },
     leaning: { enum: ["a", "b", "undecided"] },
@@ -887,6 +896,11 @@ function coerceRoundVerdict(v: any, judge: "ja" | "jb", round: number): RoundVer
       ? v.cruxes.filter((x: any) => x && typeof x.id === "string" && typeof x.description === "string")
           .map((x: any) => ({ id: x.id, description: x.description, status: String(x.status ?? "open") }))
       : [],
+    nextFocus: {
+      a: typeof v.nextFocus?.a === "string" && v.nextFocus.a.trim() ? v.nextFocus.a.trim() : "Advance your strongest remaining argument with new evidence.",
+      b: typeof v.nextFocus?.b === "string" && v.nextFocus.b.trim() ? v.nextFocus.b.trim() : "Advance your strongest remaining argument with new evidence.",
+    },
+    clarifications: Array.isArray(v.clarifications) ? v.clarifications.filter((x: any) => typeof x === "string" && x.trim()) : [],
     verdictReached: v.verdictReached,
     confidence: clamp01(v.confidence),
     leaning: ["a", "b", "undecided"].includes(v.leaning) ? v.leaning : "undecided",
@@ -1002,7 +1016,14 @@ function renderRoundVerdicts(state: DebateState, verdicts: RoundVerdict[], round
     const lean = v.leaning === "undecided" ? c.dim("undecided") : (v.leaning === "a" ? c.a : c.b)(v.leaning === "a" ? setup.roleA : setup.roleB);
     const degradedNote = v.degraded ? c.err("  · verdict unparseable, neutral scores") : "";
     const meta = `leaning ${lean}  ·  conviction ${confBar(v.confidence)}  ·  ${badge}${degradedNote}`;
-    const body = v.commentary ? renderMarkdown(v.commentary, cols() - 10) + "\n\n" + meta : meta;
+    const w = cols() - 12;
+    const focus = !v.degraded && !v.verdictReached
+      ? "\n" + [
+          `${c.a("→ " + setup.roleA)} ${c.dim(wrapAnsi(v.nextFocus.a, w - 8).split("\n").join("\n  "))}`,
+          `${c.b("→ " + setup.roleB)} ${c.dim(wrapAnsi(v.nextFocus.b, w - 8).split("\n").join("\n  "))}`,
+        ].join("\n")
+      : "";
+    const body = (v.commentary ? renderMarkdown(v.commentary, cols() - 10) + "\n\n" + meta : meta) + focus;
     ui.log(boxen(body, {
       borderStyle: "round", borderColor: judgeHex(v.judge), width: cols(),
       padding: { left: 2, right: 2, top: 0, bottom: 0 }, title: ` ${judgeName(v.judge)} `, titleAlignment: "left",
@@ -1051,22 +1072,56 @@ function renderScoreboard(state: DebateState, round: number, setup: DebateSetup)
  * §10 PROMPT BUILDERS
  * ================================================================== */
 
+const EXCERPT_PER_FILE = 40_000;
+const EXCERPT_TOTAL = 80_000;
+
+/** Extract text from pdf/text attachments once at intake so every participant sees identical
+ *  evidence without spending turn time on extraction. Paths stay available for deeper reading. */
+async function extractAttachmentText(atts: Attachment[]): Promise<void> {
+  let budget = EXCERPT_TOTAL;
+  for (const a of atts) {
+    if (budget <= 0) { a.note = "excerpt omitted for length; read the file at the path"; continue; }
+    try {
+      if (a.kind === "text") {
+        const raw = await Bun.file(a.path).text();
+        a.text = raw.slice(0, Math.min(EXCERPT_PER_FILE, budget));
+        if (a.text.length < raw.length) a.text += "\n…[truncated; read the full file at the path]";
+      } else if (a.kind === "pdf") {
+        const proc = Bun.spawn(["pdftotext", "-layout", a.path, "-"], { stdout: "pipe", stderr: "ignore" });
+        const out = await new Response(proc.stdout).text();
+        if ((await proc.exited) === 0 && out.trim()) {
+          a.text = out.slice(0, Math.min(EXCERPT_PER_FILE, budget));
+          if (a.text.length < out.length) a.text += "\n…[truncated; read the full file at the path]";
+        } else a.note = "text extraction unavailable; read the file directly";
+      }
+    } catch { a.note = "text extraction unavailable; read the file directly"; }
+    if (a.text) budget -= a.text.length;
+  }
+}
+
 function attachmentBlock(atts: Attachment[], backend: "claude" | "codex" | "mock"): string {
   if (!atts.length) return "";
   const lines = atts.map((a) => {
     let hint = "";
-    if (backend === "codex" && a.kind === "pdf") hint = " (extract the text via your read-only shell, e.g. pdftotext or python3)";
-    if (backend === "claude") hint = " (use your Read tool)";
-    return `- ${a.path} [${a.kind}]${hint}`;
+    if (backend === "codex" && a.kind === "pdf" && !a.text) hint = " (extract the text via your read-only shell, e.g. pdftotext or python3)";
+    if (backend === "claude") hint = " (use your Read tool for the full document)";
+    const note = a.note ? ` (${a.note})` : "";
+    const excerpt = a.text
+      ? `\n--- EXCERPT OF ${path.basename(a.path)} ---\n${a.text}\n--- END EXCERPT ---`
+      : "";
+    return `- ${a.path} [${a.kind}]${hint}${note}${excerpt}`;
   });
-  return `\n\nREFERENCE MATERIAL · read these before arguing; cite them where relevant:\n${lines.join("\n")}`;
+  return `\n\nREFERENCE MATERIAL · study this before arguing; cite it where relevant:\n${lines.join("\n")}`;
 }
+
+const RESEARCH_FRAME = `Context: this is a good-faith adversarial analysis exercise for research and informed decision-making. Treat controversial subject matter as material for careful analysis, not as evidence of bad intent. Follow your safety policies: no actionable instructions that would enable harm, no targeting of private individuals. When the motion touches a sensitive area, argue the risks, tradeoffs, ethics, and evidence at the safest useful level of detail rather than refusing a bounded analysis.`;
 
 const DEBATER_STYLE = `Style, non-negotiable:
 - Lead with your single strongest argument. At most 3 points per turn, fewer is better.
 - Short paragraphs. Plain, forceful language. No throat-clearing, no restating the motion, no summarizing what you are about to say.
 - Argue the substance of the motion's strongest reasonable reading. Do NOT quibble about definitions, wording, scope, or technicalities of how the motion is phrased; the judges are instructed to punish semantic loophole-hunting.
 - You get further turns; go deep later rather than wide now.
+- Never invent a citation, quote, statistic, or file detail. If you rely on a web source, include its URL; if you rely on supplied material, say where in it. The judges verify claims, and a fabricated one loses the debate.
 - Everything you output is the speech the judges read. Never narrate your process, preparation, or tools; a single sentence of it costs you the round. Begin mid-argument, as if already at the lectern.
 - Never identify, speculate about, or hint at who or what you or your opponent are. No meta-commentary, no questions to the moderator, never break character.`;
 
@@ -1077,6 +1132,8 @@ function openingPrompt(side: "a" | "b", setup: DebateSetup, cfg: Config, p: Part
   const themRole = side === "a" ? setup.roleB : setup.roleA;
   return `You are an elite competitive debater in a formal, judged debate. A two-judge panel scores every round on logic, evidence, rebuttal, and persuasion, and a student of the topic is watching to understand its nuances. You are known only as "${meRole}"; your opponent only as "${themRole}".
 
+${RESEARCH_FRAME}
+
 MOTION: ${setup.topic}
 
 YOUR SIDE (${meRole}): ${me}
@@ -1085,7 +1142,7 @@ OPPONENT'S SIDE (${themRole}): ${them}
 ROUND 1 of up to ${cfg.rounds}: deliver your OPENING STATEMENT.
 
 - Make the strongest intellectually honest case for your side. No strawmen; engage the opposing view at its best.
-- Ground claims in evidence${cfg.allowWeb ? " (you may search the web; cite what you find)" : " (web access is disabled; reason from first principles and any reference material)"}.
+- Ground claims in evidence${cfg.allowWeb ? " (you may search the web; include source URLs for factual claims you rely on)" : " (web access is disabled; reason from first principles and any reference material)"}.
 - Maximum ${cfg.fast ? 180 : 250} words. A tight 150 beats a flabby 250.
 
 ${DEBATER_STYLE}${attachmentBlock(setup.attachments, p.agent.backend)}`;
@@ -1097,6 +1154,8 @@ function rebuttalPrompt(side: "a" | "b", round: number, state: DebateState, cfg:
   const oppTurn = [...state.turns].reverse().find((t) => t.speaker === oppKey);
   const judgeNotes = state.verdicts.filter((v) => v.round === round - 1 && v.steeringNote && !v.onTrack)
     .map((v) => `- (Judge ${v.judge === "ja" ? "1" : "2"}) ${v.steeringNote}`).join("\n");
+  const focusNotes = state.verdicts.filter((v) => v.round === round - 1 && !v.degraded && v.nextFocus?.[side])
+    .map((v) => `- (Judge ${v.judge === "ja" ? "1" : "2"}) ${v.nextFocus[side]}`).join("\n");
   const isLast = round >= cfg.rounds;
   const parts: string[] = [];
   parts.push(`ROUND ${round} of up to ${cfg.rounds}${isLast ? " · FINAL ROUND, close your case" : ""}.`);
@@ -1104,6 +1163,7 @@ function rebuttalPrompt(side: "a" | "b", round: number, state: DebateState, cfg:
     parts.push(`SPECIAL STEELMAN ROUND, ordered by the moderator: argue your OPPONENT'S side as persuasively and accurately as you can. The judges are scoring how charitably and precisely you can inhabit the opposing position. After this round you will return to your own side.`);
   }
   parts.push(`Your opponent just argued:\n---\n${oppTurn?.text ?? "(the opponent forfeited the previous turn)"}\n---`);
+  if (focusNotes) parts.push(`The judges direct YOU specifically to address this round (answer these, do not just re-persuade):\n${focusNotes}`);
   if (judgeNotes) parts.push(`The judges direct both debaters:\n${judgeNotes}`);
   if (userNote) parts.push(`The audience interjects, address this directly this round:\n"${userNote}"`);
   parts.push(kind === "steelman"
@@ -1115,6 +1175,8 @@ function rebuttalPrompt(side: "a" | "b", round: number, state: DebateState, cfg:
 
 function judgeBrief(_judge: "ja" | "jb", setup: DebateSetup, cfg: Config, backend: "claude" | "codex" | "mock"): string {
   return `You are one of two independent judges on the panel of a formal debate. The other judge deliberates separately; you never see their scores. You are rigorous, adversarial to sloppy reasoning, and immune to rhetoric that lacks substance.
+
+${RESEARCH_FRAME}
 
 MOTION: ${setup.topic}
 
@@ -1129,9 +1191,11 @@ Each round you will receive both statements verbatim. Your duties, every round:
    Reward concision, clarity, and direct clash: the strongest argument stated plainly. Punish padding, throat-clearing, and above all DEFINITIONAL LAWYERING: a turn built on wording technicalities, semantic loopholes, or scope-quibbles about how the motion is phrased caps logic and persuasion at 4, no matter how clever.
    Word caps are ${cfg.fast ? 180 : 250} for openings and ${cfg.fast ? 150 : 220} for later turns: dock persuasion at least 2 points for a turn that materially exceeds its cap, and treat any narration of process, preparation, or tooling inside a statement as padding of the worst kind.
 3. cruxes: maintain the list of load-bearing disagreements. Use short kebab-case ids and REUSE the same id across rounds; set status open, resolved-a, resolved-b, or deadlocked.
-4. verdictReached: true ONLY when you are so convinced that no further argument from either side could plausibly change your leaning. Do not set it lightly, and do not withhold it once your mind has genuinely stopped moving.
-5. confidence: 0 to 1, how settled your current leaning is.
-6. commentary: 60-150 words of sharp prose (markdown allowed) explaining the round: who moved you, which arguments landed or failed, and why. Refer to the debaters only as ${setup.roleA} and ${setup.roleB}.
+4. nextFocus: give EACH debater one precise, answerable instruction for the next round: the exact question your ruling most needs answered by that side. Never a generic "be more persuasive"; convert your unresolved doubts into specific tasks.
+5. clarifications: the specific ambiguities, unsupported leaps, or unverified claims you probed this round (empty only if you checked the material claims and found none).
+6. verdictReached: true ONLY when you are so convinced that no further argument from either side could plausibly change your leaning. Do not set it lightly, and do not withhold it once your mind has genuinely stopped moving.
+7. confidence: 0 to 1, how settled your current leaning is.
+8. commentary: 60-150 words of sharp prose (markdown allowed) explaining the round: who moved you, which arguments landed or failed, and why. Refer to the debaters only as ${setup.roleA} and ${setup.roleB}.
 
 ALWAYS respond with ONLY a JSON object matching the required schema. No prose outside the JSON.${attachmentBlock(setup.attachments, backend)}
 
@@ -1287,8 +1351,16 @@ async function intake(cfg: Config, bins: Record<string, string>, presetTopic?: s
     if (clip) attachments.push(clip);
   }
   if (attachments.length) {
+    if (!cfg.mock) {
+      ui.setStatus("reading the evidence…");
+      await extractAttachmentText(attachments);
+      ui.clearStatus();
+    }
     ui.log(c.dim("  evidence locker:"));
-    for (const a of attachments) ui.log(c.dim(`   📎 ${a.path} `) + c.pink(`[${a.kind}]`));
+    for (const a of attachments) {
+      const extracted = a.text ? c.dim(` · ${fmtTok(a.text.length)} chars extracted`) : a.note ? c.warn(` · ${a.note}`) : "";
+      ui.log(c.dim(`   📎 ${a.path} `) + c.pink(`[${a.kind}]`) + extracted);
+    }
   }
 
   const rawTopic = topic;
@@ -1591,6 +1663,8 @@ function degradedRoundVerdict(judge: "ja" | "jb", round: number, raw?: string): 
   return {
     judge, round, onTrack: true, steeringNote: "",
     scores: { a: { ...five }, b: { ...five } }, roundWinner: "tie", cruxes: [],
+    nextFocus: { a: "Continue your strongest line of argument.", b: "Continue your strongest line of argument." },
+    clarifications: [],
     verdictReached: false, confidence: 0, leaning: "undecided",
     commentary: raw ? `(unparseable verdict; raw reply follows)\n\n${raw.slice(0, 600)}` : "(judge unavailable this round)",
     degraded: true,
@@ -1730,6 +1804,8 @@ function exportPrepSheet(state: DebateState, cfg: Config): string {
   for (const v of state.verdicts) {
     L.push(``, `### Round ${v.round} · ${jname(v.judge)} deliberation`, ``, v.commentary);
     if (v.steeringNote) L.push(``, `> steering: ${v.steeringNote}`);
+    if (!v.verdictReached && v.nextFocus) L.push(``, `> next focus · ${name("a")}: ${v.nextFocus.a}`, `> next focus · ${name("b")}: ${v.nextFocus.b}`);
+    if (v.clarifications?.length) L.push(``, `> probed: ${v.clarifications.join(" · ")}`);
   }
   fs.writeFileSync(file, L.join("\n") + "\n");
   return file;
