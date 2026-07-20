@@ -319,6 +319,7 @@ interface DebateState {
   notes: { round: number; from: string; text: string }[];
   totals: { costUsd: number; inTok: number; outTok: number };
   endReason?: "panel" | "cap" | "user" | "abandoned";
+  endDetail?: string;
 }
 
 interface Config {
@@ -902,7 +903,9 @@ function coerceRoundVerdict(v: any, judge: "ja" | "jb", round: number): RoundVer
     },
     clarifications: Array.isArray(v.clarifications) ? v.clarifications.filter((x: any) => typeof x === "string" && x.trim()) : [],
     verdictReached: v.verdictReached,
-    confidence: clamp01(v.confidence),
+    // An undecided judge cannot be highly convinced of a winner; clamp so the
+    // stop ramp and the conviction bar cannot read "undecided" as "settled".
+    confidence: (["a", "b"].includes(v.leaning) ? clamp01(v.confidence) : Math.min(clamp01(v.confidence), 0.5)),
     leaning: ["a", "b", "undecided"].includes(v.leaning) ? v.leaning : "undecided",
     commentary: v.commentary,
   };
@@ -939,8 +942,9 @@ function speakerHeader(p: Participant, roundLabel: string) {
 
 function fmtTok(n: number) { return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n); }
 
-function usageFooter(r: TurnResult) {
+function usageFooter(r: TurnResult, showWords = false) {
   const parts = [`${Math.round(r.durationMs / 1000)}s`, `in ${fmtTok(r.usage.inTok)} / out ${fmtTok(r.usage.outTok)} tok`];
+  if (showWords) parts.push(`${r.text.split(/\s+/).filter(Boolean).length} words`);
   if (typeof r.usage.costUsd === "number") parts.push(`$${r.usage.costUsd.toFixed(3)}`);
   ui.log(c.dim(`   ↳ ${parts.join(" · ")}`));
 }
@@ -980,7 +984,7 @@ async function renderTurnStream(gen: AsyncGenerator<AgentEvent, TurnResult>, o: 
         if (o.showBody) {
           contentBox(o.p, `${o.p.label}${o.p.role ? " · " + o.p.role : ""}`, result.text || "(empty statement)");
         }
-        usageFooter(result);
+        usageFooter(result, o.showBody);
         return result;
       }
       lastEvent = Date.now();
@@ -1056,7 +1060,8 @@ function renderScoreboard(state: DebateState, round: number, setup: DebateSetup)
 
   const cruxLines: string[] = [];
   for (const [judge, map] of state.cruxes) {
-    for (const cx of map.values()) {
+    // cap per judge, not overall, so one prolific judge cannot crowd the other out
+    for (const cx of [...map.values()].slice(-6)) {
       const glyph = cx.status === "open" ? c.dim("○") : cx.status === "resolved-a" ? c.a("✔") : cx.status === "resolved-b" ? c.b("✔") : c.err("⚔");
       const desc = cx.description.length > 70 ? cx.description.slice(0, 69).replace(/\s+\S*$/, "") + "…" : cx.description;
       cruxLines.push(`  ${glyph} ${c.fg(cx.id)} ${c.dim(`(${judgePaint(judge as "ja" | "jb")(judge === "ja" ? "judge 1" : "judge 2")}${c.dim(", " + cx.status + ")")}`)} ${c.dim("· " + desc)}`);
@@ -1064,7 +1069,7 @@ function renderScoreboard(state: DebateState, round: number, setup: DebateSetup)
   }
   if (cruxLines.length) {
     ui.log(" " + c.pink("CRUXES") + c.dim(" · the load-bearing disagreements"));
-    for (const l of cruxLines.slice(0, 8)) ui.log(l);
+    for (const l of cruxLines) ui.log(l);
   }
 }
 
@@ -1189,12 +1194,12 @@ Each round you will receive both statements verbatim. Your duties, every round:
 1. onTrack / steeringNote: police drift, definitional games, and repetition. If off track, say exactly how to correct course.
 2. scores: score EACH debater 0-10 on ${AXES.join(", ")}. 5 is competent; reserve 9-10 for exceptional work.
    Reward concision, clarity, and direct clash: the strongest argument stated plainly. Punish padding, throat-clearing, and above all DEFINITIONAL LAWYERING: a turn built on wording technicalities, semantic loopholes, or scope-quibbles about how the motion is phrased caps logic and persuasion at 4, no matter how clever.
-   Word caps are ${cfg.fast ? 180 : 250} for openings and ${cfg.fast ? 150 : 220} for later turns: dock persuasion at least 2 points for a turn that materially exceeds its cap, and treat any narration of process, preparation, or tooling inside a statement as padding of the worst kind.
+   Word caps are ${cfg.fast ? 180 : 250} for openings and ${cfg.fast ? 150 : 220} for later turns; each statement arrives with its exact word count. Dock persuasion at least 2 points for a turn that materially exceeds its cap (more than ~15% over), and treat any narration of process, preparation, or tooling inside a statement as padding of the worst kind.
 3. cruxes: maintain the list of load-bearing disagreements. Use short kebab-case ids and REUSE the same id across rounds; set status open, resolved-a, resolved-b, or deadlocked.
 4. nextFocus: give EACH debater one precise, answerable instruction for the next round: the exact question your ruling most needs answered by that side. Never a generic "be more persuasive"; convert your unresolved doubts into specific tasks.
 5. clarifications: the specific ambiguities, unsupported leaps, or unverified claims you probed this round (empty only if you checked the material claims and found none).
 6. verdictReached: true ONLY when you are so convinced that no further argument from either side could plausibly change your leaning. Do not set it lightly, and do not withhold it once your mind has genuinely stopped moving.
-7. confidence: 0 to 1, how settled your current leaning is.
+7. confidence: 0 to 1, the probability that your CURRENT LEANING would survive the strongest remaining counterargument. It is conviction in a winner, not confidence in your analysis. If leaning is "undecided", confidence must be 0.5 or lower.
 8. commentary: 60-150 words of sharp prose (markdown allowed) explaining the round: who moved you, which arguments landed or failed, and why. Refer to the debaters only as ${setup.roleA} and ${setup.roleB}.
 
 ALWAYS respond with ONLY a JSON object matching the required schema. No prose outside the JSON.${attachmentBlock(setup.attachments, backend)}
@@ -1210,8 +1215,10 @@ function judgeRoundPrompt(round: number, state: DebateState, cfg: Config, aText:
   if (userNote) parts.push(`The audience interjected this round: "${userNote}"`);
   if (deadlockHint) parts.push("The debate appears deadlocked (repeated ties, cruxes unmoved). Unless this round materially moved a crux, strongly consider verdictReached=true.");
   if (round >= 4) parts.push("Novelty check: if this round added no genuinely new argument or evidence, your conviction should be converging.");
-  parts.push(`DEBATER "a" (${state.setup.roleA}):\n---\n${aText}\n---`);
-  parts.push(`DEBATER "b" (${state.setup.roleB}):\n---\n${bText}\n---`);
+  const cap = round === 1 ? (cfg.fast ? 180 : 250) : (cfg.fast ? 150 : 220);
+  const wc = (t: string) => t.split(/\s+/).filter(Boolean).length;
+  parts.push(`DEBATER "a" (${state.setup.roleA}) · ${wc(aText)} words against a ${cap}-word cap:\n---\n${aText}\n---`);
+  parts.push(`DEBATER "b" (${state.setup.roleB}) · ${wc(bText)} words against a ${cap}-word cap:\n---\n${bText}\n---`);
   parts.push("Return ONLY the round-verdict JSON.");
   return parts.join("\n\n");
 }
@@ -1564,9 +1571,17 @@ async function runDebate(setup: DebateSetup, cfg: Config, bins: Record<string, s
       renderRoundVerdicts(state, roundVerdicts, round, setup);
 
       // ---- stop? ----
+      // A judge is settled only if it says no argument could move it, or its
+      // conviction in an ACTUAL LEANING has crossed the ramp. "Undecided at
+      // high confidence" means confidently contested, which must not end a debate.
       const ramp = RAMP[Math.min(round, RAMP.length - 1)];
-      const allSettled = roundVerdicts.every((v) => !v.degraded && (v.verdictReached || v.confidence >= ramp));
-      if (round >= 2 && allSettled) { state.endReason = "panel"; break; }
+      const allSettled = roundVerdicts.every((v) =>
+        !v.degraded && (v.verdictReached || (v.confidence >= ramp && v.leaning !== "undecided")));
+      if (round >= 2 && allSettled) {
+        state.endReason = "panel";
+        if (!roundVerdicts.every((v) => v.verdictReached)) state.endDetail = "panel conviction crossed the stop threshold";
+        break;
+      }
       if (round >= cfg.rounds) { state.endReason = "cap"; break; }
 
       // ---- between rounds ----
@@ -1624,7 +1639,7 @@ async function runDebate(setup: DebateSetup, cfg: Config, bins: Record<string, s
   if (state.endReason !== "abandoned") {
     ui.log();
     rule(P.pink, "═");
-    ui.log(" " + gradientText("FINAL VERDICTS", [P.pink, P.purple, P.cyan]) + c.dim(`  · ${endReasonLabel(state.endReason)}`));
+    ui.log(" " + gradientText("FINAL VERDICTS", [P.pink, P.purple, P.cyan]) + c.dim(`  · ${state.endDetail ?? endReasonLabel(state.endReason)}`));
     rule(P.pink, "═");
     const fPrompt = judgeFinalPrompt(state, cfg);
     const fGens = judges.map((j, i) => (i > 0 && !cfg.mock) ? pump(j.agent.runTurn({ prompt: fPrompt, schema: FINAL_SCHEMA })) : undefined);
@@ -1758,7 +1773,7 @@ function exportPrepSheet(state: DebateState, cfg: Config): string {
   L.push(``);
   L.push(`- ${name("a")} vs ${name("b")} · mode: ${setup.mode}`);
   L.push(`- Engine reveal (hidden from every participant during the debate): ${name("a")} = ${cfg.modelA || "claude default"} (${cfg.effortA}), ${name("b")} = ${cfg.modelB || "codex default"} (${cfg.effortB}); Judge 1 = ${cfg.judgeModelA || "claude default"}, Judge 2 = ${cfg.judgeModelB || "codex default"}`);
-  L.push(`- Ended: ${endReasonLabel(state.endReason)} after ${state.round} round(s) · ${new Date(state.startedAt).toString()}`);
+  L.push(`- Ended: ${state.endDetail ?? endReasonLabel(state.endReason)} after ${state.round} round(s) · ${new Date(state.startedAt).toString()}`);
   L.push(`- Web research: ${cfg.allowWeb ? "on" : "off"} · totals: ${state.totals.inTok} in / ${state.totals.outTok} out tokens${state.totals.costUsd ? ` · $${state.totals.costUsd.toFixed(2)} (engine A side)` : ""}`);
   if (setup.attachments.length) {
     L.push(`- Evidence: ${setup.attachments.map((a) => `${a.path} [${a.kind}]`).join(", ")}`);
