@@ -308,12 +308,23 @@ interface Turn {
   text: string; thinking: string; usage: Usage; durationMs: number;
 }
 
+interface ConferenceNote {
+  judge: "ja" | "jb";
+  interpretiveDifference: string;
+  sharedStandard: string;
+  positionChanged: boolean;
+  leaning: "a" | "b" | "undecided";
+  confidence: number;
+  note: string;
+}
+
 interface DebateState {
   setup: DebateSetup;
   startedAt: number;
   round: number;
   turns: Turn[];
   verdicts: RoundVerdict[];
+  conferences: { round: number; kind: "round" | "final"; notes: ConferenceNote[] }[];
   finals: FinalVerdict[];
   cruxes: Map<string, Map<string, Crux>>;   // judgeKey -> cruxId -> crux
   notes: { round: number; from: string; text: string }[];
@@ -329,7 +340,7 @@ interface Config {
   modelB: string; effortB: string;          // codex debater
   judgeModelA: string; judgeEffortA: string;
   judgeModelB: string; judgeEffortB: string;
-  pause: boolean; sideMode: "auto" | "dialectic"; sharpen: boolean;
+  pause: boolean; sideMode: "auto" | "dialectic"; sharpen: boolean; confer: boolean;
   auto: boolean; mock: boolean; debugEvents: boolean; fast: boolean; tty: boolean;
 }
 
@@ -746,6 +757,18 @@ class MockAgent implements AgentBackend {
     yield { kind: "session", id: this.sessionId };
     const round = Number(o.prompt.match(/ROUND (\d+)/)?.[1] ?? 1);
     const isFinal = /FINAL VERDICT/.test(o.prompt);
+    if ((this.who === "ja" || this.who === "jb") && /PANEL CONFERENCE/.test(o.prompt)) {
+      await Bun.sleep(80);
+      const obj = {
+        interpretiveDifference: "We weight the same record differently: I treat the empirical trend as decisive; my colleague treats it as provisional pending a mechanism.",
+        sharedStandard: "Affirm the motion only if the strongest counter-case still loses on the shared evidence.",
+        positionChanged: this.who === "jb",
+        leaning: this.who === "ja" ? "a" : "b",
+        confidence: this.who === "ja" ? 0.8 : 0.62,
+        note: "I hold. The **trend evidence** answers the mechanism worry; a diagnosis without an alternative explanation should not outweigh it.",
+      };
+      return { text: JSON.stringify(obj), thinking: "", structured: obj, usage: { inTok: 400, outTok: 90, costUsd: this.who === "ja" ? 0.005 : undefined }, durationMs: Date.now() - started };
+    }
     const chunks = [
       "Weighing the strongest form of the opposing case before committing to a line of attack. ",
       "The evidence base splits into empirical claims and value claims; the empirical ones are testable. ",
@@ -847,6 +870,33 @@ const ROUND_SCHEMA = strict({
     commentary: { type: "string" },
   },
 });
+
+const CONFERENCE_SCHEMA = strict({
+  type: "object",
+  required: ["interpretiveDifference", "sharedStandard", "positionChanged", "leaning", "confidence", "note"],
+  properties: {
+    interpretiveDifference: { type: "string" },
+    sharedStandard: { type: "string" },
+    positionChanged: { type: "boolean" },
+    leaning: { enum: ["a", "b", "undecided"] },
+    confidence: { type: "number", minimum: 0, maximum: 1 },
+    note: { type: "string" },
+  },
+});
+
+function coerceConference(v: any, judge: "ja" | "jb"): ConferenceNote | null {
+  if (!v || typeof v !== "object" || typeof v.note !== "string") return null;
+  const leaning = ["a", "b", "undecided"].includes(v.leaning) ? v.leaning : "undecided";
+  return {
+    judge,
+    interpretiveDifference: String(v.interpretiveDifference ?? ""),
+    sharedStandard: String(v.sharedStandard ?? ""),
+    positionChanged: v.positionChanged === true,
+    leaning,
+    confidence: leaning === "undecided" ? Math.min(clamp01(v.confidence), 0.5) : clamp01(v.confidence),
+    note: v.note,
+  };
+}
 
 const strArr = { type: "array", items: { type: "string" } };
 const FINAL_SCHEMA = strict({
@@ -1215,6 +1265,11 @@ function judgeRoundPrompt(round: number, state: DebateState, cfg: Config, aText:
   if (userNote) parts.push(`The audience interjected this round: "${userNote}"`);
   if (deadlockHint) parts.push("The debate appears deadlocked (repeated ties, cruxes unmoved). Unless this round materially moved a crux, strongly consider verdictReached=true.");
   if (round >= 4) parts.push("Novelty check: if this round added no genuinely new argument or evidence, your conviction should be converging.");
+  const conf = state.conferences.filter((cn) => cn.round === round - 1 && cn.kind === "round").at(-1);
+  if (conf) {
+    const std = conf.notes.map((n) => `- (Judge ${n.judge === "ja" ? "1" : "2"}) ${n.sharedStandard}`).join("\n");
+    parts.push(`After the previous round the panel conferred on its split. The proposed shared standards were:\n${std}\nScore this round against the standard you concluded is correct, and say in your commentary whether the split is narrowing.`);
+  }
   const cap = round === 1 ? (cfg.fast ? 180 : 250) : (cfg.fast ? 150 : 220);
   const wc = (t: string) => t.split(/\s+/).filter(Boolean).length;
   parts.push(`DEBATER "a" (${state.setup.roleA}) · ${wc(aText)} words against a ${cap}-word cap:\n---\n${aText}\n---`);
@@ -1227,7 +1282,13 @@ function judgeFinalPrompt(state: DebateState, _cfg: Config): string {
   const reason = state.endReason === "cap" ? "the round cap was reached"
     : state.endReason === "user" ? "the human moderator called for verdicts"
     : "the panel is beyond persuasion";
-  return `The debate has ended (${reason}). Deliver your FINAL VERDICT as JSON:
+  const fin = state.conferences.find((cn) => cn.kind === "final");
+  const confBlock = fin
+    ? `\n\nBefore verdicts the panel conferred on its split. The notes exchanged:\n${fin.notes.map((n) => `- (Judge ${n.judge === "ja" ? "1" : "2"}) ${n.note} [proposed standard: ${n.sharedStandard}]`).join("\n")}\nWeigh your colleague's reasoning, but deliver YOUR OWN verdict; converge only if genuinely persuaded.`
+    : "";
+  return `The debate has ended (${reason}).${confBlock}
+
+Deliver your FINAL VERDICT as JSON:
 - winner ("a"=${state.setup.roleA}, "b"=${state.setup.roleB}, or "draw") and confidence (0-1)
 - bestArguments / worstArguments: the strongest and weakest arguments EACH side made (quote or closely paraphrase)
 - decidingFactors: what ultimately convinced you, the reasoning that settled it
@@ -1467,6 +1528,72 @@ function makeBackend(kind: "claude" | "codex", bins: Record<string, string>, bcf
   return kind === "claude" ? new ClaudeAgent(bins.claude, bcfg, tag) : new CodexAgent(bins.codex, bcfg, tag);
 }
 
+function conferencePrompt(colleague: RoundVerdict, kind: "round" | "final", setup: DebateSetup): string {
+  const leanLabel = colleague.leaning === "a" ? setup.roleA : colleague.leaning === "b" ? setup.roleB : "undecided";
+  const sum = (s: Record<string, number>) => AXES.reduce((t, k) => t + (s[k] ?? 0), 0);
+  return `PANEL CONFERENCE${kind === "final" ? " · BEFORE FINAL VERDICTS" : ` · ROUND ${colleague.round}`}
+
+The panel is split. Your co-judge deliberated independently and reached a different position. Their latest deliberation, verbatim:
+---
+leaning: ${leanLabel} · conviction ${(colleague.confidence * 100).toFixed(0)}% · beyond persuasion: ${colleague.verdictReached ? "yes" : "no"}
+scores: ${setup.roleA} ${AXES.map((k) => colleague.scores.a[k]).join("·")} = ${sum(colleague.scores.a)} · ${setup.roleB} ${AXES.map((k) => colleague.scores.b[k]).join("·")} = ${sum(colleague.scores.b)}
+commentary: ${colleague.commentary}
+---
+
+Confer, then respond ONLY with the conference JSON:
+1. interpretiveDifference: name precisely what KIND of disagreement this is: a factual reading, a different weighting of the same facts, or a different interpretation of what the motion requires. Cite the exact point of divergence.
+2. sharedStandard: propose ONE neutral standard both judges could apply from here (for example: what exactly must be true for the motion to be affirmed). It must be a standard you would accept even if applying it favors the side you currently score lower.
+3. positionChanged / leaning / confidence: reconsider your position in light of their reasoning, and revise ONLY if genuinely moved. Do not converge for politeness and do not split the difference: a genuinely split panel is a legitimate outcome, a false consensus is a failure. If you hold, be exact about what your colleague is getting wrong.
+4. note: up to 120 words addressed to your colleague, markdown allowed.`;
+}
+
+async function runConference(judges: Participant[], state: DebateState, round: number, kind: "round" | "final", cfg: Config): Promise<void> {
+  const vA = [...state.verdicts].reverse().find((v) => v.judge === "ja" && v.round === round);
+  const vB = [...state.verdicts].reverse().find((v) => v.judge === "jb" && v.round === round);
+  if (!vA || !vB || vA.degraded || vB.degraded) return;
+  ui.log();
+  ui.log(" " + c.pink.bold("⚖ PANEL CONFERENCE") + c.dim(kind === "final" ? " · the panel is split going into final verdicts" : " · the judges reached opposite positions; they now confer"));
+  const prompts: Record<string, string> = {
+    ja: conferencePrompt(vB, kind, state.setup),
+    jb: conferencePrompt(vA, kind, state.setup),
+  };
+  const gens = judges.map((j, i) => (i > 0 && !cfg.mock) ? pump(j.agent.runTurn({ prompt: prompts[j.key], schema: CONFERENCE_SCHEMA })) : undefined);
+  const notes: ConferenceNote[] = [];
+  for (let i = 0; i < judges.length; i++) {
+    const j = judges[i];
+    const { res, parsed } = await judgeTurn(j, prompts[j.key], CONFERENCE_SCHEMA,
+      { p: j, roundLabel: kind === "final" ? "CONFERENCE · PRE-VERDICT" : `CONFERENCE · ROUND ${round}`, showBody: false, verb: "conferring" }, cfg, gens[i]);
+    tally(state, res);
+    const note = coerceConference(parsed, j.key as "ja" | "jb");
+    if (note) notes.push(note);
+  }
+  if (!notes.length) { ui.log(c.dim("  (the conference produced no usable notes)")); return; }
+  state.conferences.push({ round, kind, notes });
+
+  const w = cols() - 12;
+  const leanName = (l: "a" | "b" | "undecided") => (l === "a" ? state.setup.roleA : l === "b" ? state.setup.roleB : "undecided");
+  const paintLean = (l: "a" | "b" | "undecided") => (l === "a" ? c.a(leanName(l)) : l === "b" ? c.b(leanName(l)) : c.dim("undecided"));
+  for (const n of notes) {
+    const v = n.judge === "ja" ? vA : vB;
+    const before = `${leanName(v.leaning)} · ${(v.confidence * 100).toFixed(0)}%`;
+    if (n.positionChanged) { v.leaning = n.leaning; v.confidence = n.confidence; }
+    const position = n.positionChanged
+      ? `${c.warn("revised")} · ${before} → ${paintLean(v.leaning)} ${c.dim(`· ${(v.confidence * 100).toFixed(0)}%`)}`
+      : `${c.dim("held")} · ${paintLean(v.leaning)} ${c.dim(`· ${(v.confidence * 100).toFixed(0)}%`)}`;
+    const body = [
+      renderMarkdown(n.note || "(no note)", w),
+      "",
+      c.pink("difference ") + c.dim(wrapAnsi(n.interpretiveDifference, w - 11).split("\n").join("\n  ")),
+      c.pink("standard   ") + c.dim(wrapAnsi(n.sharedStandard, w - 11).split("\n").join("\n  ")),
+      c.pink("position   ") + position,
+    ].join("\n");
+    ui.log(boxen(body, {
+      borderStyle: "round", borderColor: judgeHex(n.judge), width: cols(),
+      padding: { left: 2, right: 2, top: 0, bottom: 0 }, title: ` ${judgeName(n.judge)} · CONFERENCE `, titleAlignment: "left",
+    }));
+  }
+}
+
 function tally(state: DebateState, r: TurnResult | null) {
   if (!r) return;
   state.totals.inTok += r.usage.inTok;
@@ -1506,7 +1633,7 @@ async function runDebate(setup: DebateSetup, cfg: Config, bins: Record<string, s
 
   const state: DebateState = {
     setup, startedAt: Date.now(), round: 1, turns: [], verdicts: [], finals: [],
-    cruxes: new Map(), notes: [], totals: { costUsd: 0, inTok: 0, outTok: 0 },
+    conferences: [], cruxes: new Map(), notes: [], totals: { costUsd: 0, inTok: 0, outTok: 0 },
   };
 
   // ---- the card ----
@@ -1569,6 +1696,17 @@ async function runDebate(setup: DebateSetup, cfg: Config, bins: Record<string, s
         state.cruxes.set(j.key, jm);
       }
       renderRoundVerdicts(state, roundVerdicts, round, setup);
+
+      // ---- conference: opposite leanings mean the judges may be answering
+      // different questions; let them reconcile or crystallize the split ----
+      if (cfg.confer && judges.length === 2) {
+        const va = roundVerdicts.find((v) => v.judge === "ja");
+        const vb = roundVerdicts.find((v) => v.judge === "jb");
+        if (va && vb && !va.degraded && !vb.degraded &&
+            va.leaning !== "undecided" && vb.leaning !== "undecided" && va.leaning !== vb.leaning) {
+          await runConference(judges, state, round, "round", cfg);
+        }
+      }
 
       // ---- stop? ----
       // A judge is settled only if it says no argument could move it, or its
@@ -1637,6 +1775,16 @@ async function runDebate(setup: DebateSetup, cfg: Config, bins: Record<string, s
 
   // ---- final verdicts ----
   if (state.endReason !== "abandoned") {
+    // one last conference if the panel is still split (covers undecided-vs-decided
+    // and cap endings; skipped when this round's split already conferred)
+    if (cfg.confer && judges.length === 2 && state.verdicts.length) {
+      const va = [...state.verdicts].reverse().find((v) => v.judge === "ja");
+      const vb = [...state.verdicts].reverse().find((v) => v.judge === "jb");
+      const conferred = state.conferences.some((cn) => cn.round === state.round);
+      if (va && vb && !va.degraded && !vb.degraded && va.leaning !== vb.leaning && !conferred) {
+        await runConference(judges, state, state.round, "final", cfg);
+      }
+    }
     ui.log();
     rule(P.pink, "═");
     ui.log(" " + gradientText("FINAL VERDICTS", [P.pink, P.purple, P.cyan]) + c.dim(`  · ${state.endDetail ?? endReasonLabel(state.endReason)}`));
@@ -1807,6 +1955,19 @@ function exportPrepSheet(state: DebateState, cfg: Config): string {
     L.push(``, `## Cruxes (the load-bearing disagreements)`);
     for (const { j, cx } of cruxAll) L.push(`- \`${cx.id}\` (${jname(j as "ja" | "jb")}, ${cx.status}): ${cx.description}`);
   }
+  if (state.conferences.length) {
+    L.push(``, `## Panel conferences`);
+    for (const cn of state.conferences) {
+      L.push(``, `### ${cn.kind === "final" ? "Before final verdicts" : `After round ${cn.round}`}`);
+      for (const n of cn.notes) {
+        const lean = n.leaning === "a" ? name("a") : n.leaning === "b" ? name("b") : "undecided";
+        L.push(``, `**${jname(n.judge)}** · ${n.positionChanged ? "revised position" : "held"} · leaning ${lean} (${(n.confidence * 100).toFixed(0)}%)`);
+        L.push(`- Difference: ${n.interpretiveDifference}`);
+        L.push(`- Proposed standard: ${n.sharedStandard}`);
+        L.push(`- Note: ${n.note}`);
+      }
+    }
+  }
   if (state.notes.length) {
     L.push(``, `## Your interjections`);
     for (const n of state.notes) L.push(`- (before round ${n.round}) ${n.text}`);
@@ -1840,6 +2001,7 @@ interface Settings {
   pause: boolean;                    // pause between rounds for the interject/steelman menu
   sideMode: "auto" | "dialectic";    // auto = PRO/CON coin flip; dialectic = thesis vs antithesis
   sharpen: boolean;                  // pre-pass that rewrites the raw topic into a crisp motion
+  confer: boolean;                   // judges confer when the panel splits
 }
 
 const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
@@ -1852,7 +2014,7 @@ const DEFAULT_SETTINGS: Settings = {
   judgeModelA: "claude-opus-4-8", judgeEffortA: "medium",
   judgeModelB: "gpt-5.6-luna", judgeEffortB: "medium",
   web: true, rounds: 6,
-  pause: false, sideMode: "auto", sharpen: true,
+  pause: false, sideMode: "auto", sharpen: true, confer: true,
 };
 
 const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config"), "db8");
@@ -1870,6 +2032,7 @@ function loadSettings(): Settings {
   s.web = s.web !== false;
   s.pause = s.pause === true;
   s.sharpen = s.sharpen !== false;
+  s.confer = s.confer !== false;
   if (!["auto", "dialectic"].includes(s.sideMode)) s.sideMode = "auto";
   return s;
 }
@@ -1939,6 +2102,7 @@ async function settingsMenu(): Promise<boolean> {
         { value: "pause", label: pad("Pause rounds") + c.dim(s.pause ? "on · menu between rounds (interject, steelman, end)" : "off · debates run to completion hands-free") },
         { value: "sideMode", label: pad("Side mode") + c.dim(s.sideMode === "auto" ? "auto · PRO vs CON, coin-flip assignment" : "dialectic · thesis vs antithesis") },
         { value: "sharpen", label: pad("Sharpen motion") + c.dim(s.sharpen ? "on · a quick pre-pass turns your topic into a crisp motion" : "off · topics used verbatim") },
+        { value: "confer", label: pad("Judge conference") + c.dim(s.confer ? "on · a split panel confers to reconcile or crystallize" : "off · judges never interact") },
         { value: "reset", label: pad("Reset") + c.dim("back to factory defaults") },
         { value: "save", label: c.ok("Save and exit") },
         { value: "quit", label: c.dim("Exit without saving") },
@@ -2013,6 +2177,16 @@ async function settingsMenu(): Promise<boolean> {
         ],
       });
       if (!clack.isCancel(sh)) s.sharpen = sh === "on";
+    } else if (choice === "confer") {
+      const cf = await clack.select({
+        message: c.user("Should a split panel confer?"),
+        initialValue: s.confer ? "on" : "off",
+        options: [
+          { value: "on", label: "on", hint: "judges exchange reasoning at splits, revise only if genuinely moved" },
+          { value: "off", label: "off", hint: "judges stay fully independent all debate" },
+        ],
+      });
+      if (!clack.isCancel(cf)) s.confer = cf === "on";
     }
   }
 }
@@ -2048,6 +2222,7 @@ ${c.fg("FLAGS")} ${c.dim("(one-off overrides; saved settings stay untouched)")}
   --pause              pause between rounds (interject / steelman / end early menu)
   --dialectic          thesis vs antithesis instead of PRO vs CON
   --no-sharpen         use the topic verbatim, skip the motion-sharpening pre-pass
+  --no-confer          keep the judges fully independent; skip panel conferences
   --fast               cheap sparring: haiku + low effort everywhere, 3 rounds max
   --auto               never prompt at all (also implied when not a TTY)
   --debug-events       tee raw CLI JSONL to .debate-tmp/ for diagnosis
@@ -2125,6 +2300,7 @@ function buildCfg(flags: any, tty: boolean): Config {
     pause: flags.pause ? true : s.pause,
     sideMode: flags.dialectic ? "dialectic" : s.sideMode,
     sharpen: flags["no-sharpen"] ? false : s.sharpen,
+    confer: flags["no-confer"] ? false : s.confer,
     auto: flags.auto || !tty || !(process.stdin.isTTY ?? false),
     mock: process.env.DEBATE_MOCK === "1",
     debugEvents: flags["debug-events"], fast: flags.fast, tty,
@@ -2158,7 +2334,7 @@ async function main() {
         "judge-model": { type: "string" },
         auto: { type: "boolean", default: false }, fast: { type: "boolean", default: false },
         pause: { type: "boolean", default: false }, dialectic: { type: "boolean", default: false },
-        "no-sharpen": { type: "boolean", default: false },
+        "no-sharpen": { type: "boolean", default: false }, "no-confer": { type: "boolean", default: false },
         "debug-events": { type: "boolean", default: false }, "no-color": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
